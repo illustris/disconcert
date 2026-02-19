@@ -6,6 +6,8 @@ import (
 	"encoding/binary"
 	"flag"
 	"fmt"
+	"io"
+	"log"
 	"net"
 	"os"
 	"sort"
@@ -68,6 +70,7 @@ func main() {
 	port := flag.String("p", "443", "TLS port")
 	quiet := flag.Bool("q", false, "Quiet: suppress results for IPs that failed to connect")
 	timeout := flag.Duration("t", 5*time.Second, "Connection timeout")
+	verbose := flag.Bool("v", false, "Verbose: log each connection and DNS step to stderr")
 	workers := flag.Int("w", 32, "Number of concurrent workers")
 
 	flag.Usage = func() {
@@ -75,6 +78,13 @@ func main() {
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+
+	var debug *log.Logger
+	if *verbose {
+		debug = log.New(os.Stderr, "DEBUG: ", 0)
+	} else {
+		debug = log.New(io.Discard, "", 0)
+	}
 
 	if flag.NArg() == 0 {
 		flag.Usage()
@@ -112,10 +122,13 @@ func main() {
 
 	// Process IPs with worker pool
 	var (
-		mu      sync.Mutex
-		wg      sync.WaitGroup
-		results []result
-		sem     = make(chan struct{}, *workers)
+		mu        sync.Mutex
+		wg        sync.WaitGroup
+		results   []result
+		sem       = make(chan struct{}, *workers)
+		completed int
+		total     = len(ips)
+		showBar   = total > 1
 	)
 
 	for _, ip := range ips {
@@ -124,13 +137,20 @@ func main() {
 		go func(ip net.IP) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			r := processIP(ip, *port, *timeout, resolver, *lax)
+			r := processIP(ip, *port, *timeout, resolver, *lax, debug)
 			mu.Lock()
 			results = append(results, r)
+			completed++
+			if showBar {
+				fmt.Fprintf(os.Stderr, "\rScanning: %d/%d IPs", completed, total)
+			}
 			mu.Unlock()
 		}(ip)
 	}
 	wg.Wait()
+	if showBar {
+		fmt.Fprintf(os.Stderr, "\r%s\r", strings.Repeat(" ", 40))
+	}
 
 	// Sort results by IP
 	sort.Slice(results, func(i, j int) bool {
@@ -224,14 +244,16 @@ func incIP(ip net.IP) {
 	}
 }
 
-func processIP(ip net.IP, port string, timeout time.Duration, resolver *net.Resolver, lax bool) result {
+func processIP(ip net.IP, port string, timeout time.Duration, resolver *net.Resolver, lax bool, debug *log.Logger) result {
 	addr := net.JoinHostPort(ip.String(), port)
 
+	debug.Printf("%s: connecting to %s", ip, addr)
 	dialer := &net.Dialer{Timeout: timeout}
 	conn, err := tls.DialWithDialer(dialer, "tcp", addr, &tls.Config{
 		InsecureSkipVerify: true,
 	})
 	if err != nil {
+		debug.Printf("%s: TLS failed: %s", ip, err)
 		return result{
 			IP:        ip.String(),
 			CN:        "-",
@@ -255,6 +277,7 @@ func processIP(ip net.IP, port string, timeout time.Duration, resolver *net.Reso
 	if cn == "" && len(certs[0].DNSNames) > 0 {
 		cn = certs[0].DNSNames[0]
 	}
+	debug.Printf("%s: TLS OK, CN=%s", ip, cn)
 	if cn == "" {
 		return result{
 			IP:        ip.String(),
@@ -265,11 +288,13 @@ func processIP(ip net.IP, port string, timeout time.Duration, resolver *net.Reso
 	}
 
 	// DNS lookup
+	debug.Printf("%s: looking up %s", ip, cn)
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	addrs, err := resolver.LookupHost(ctx, cn)
 	if err != nil {
+		debug.Printf("%s: DNS error: %s", ip, err)
 		if dnsErr, ok := err.(*net.DNSError); ok && dnsErr.IsNotFound {
 			return result{
 				IP:        ip.String(),
@@ -285,6 +310,7 @@ func processIP(ip net.IP, port string, timeout time.Duration, resolver *net.Reso
 			Status:    fmt.Sprintf("ERROR: DNS lookup failed: %s", err),
 		}
 	}
+	debug.Printf("%s: %s -> %s", ip, cn, addrs)
 
 	dnsResult := strings.Join(addrs, ",")
 	ipStr := ip.String()

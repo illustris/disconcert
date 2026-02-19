@@ -39,6 +39,7 @@ disconcert [flags] <ip-or-cidr> [...]
 | `-p` | `443` | TLS port to connect to |
 | `-q` | off | Quiet: suppress results for IPs that failed to connect |
 | `-t` | `5s` | Connection and DNS timeout |
+| `-v` | off | Verbose: log each connection and DNS step to stderr |
 | `-w` | `32` | Number of concurrent workers |
 
 ### Examples
@@ -77,6 +78,12 @@ Combined lax and quiet:
 
 ```
 disconcert -l -q 8.8.8.0/29
+```
+
+Verbose mode (debug logging on stderr):
+
+```
+disconcert -v 198.51.100.0/28
 ```
 
 ## Output format

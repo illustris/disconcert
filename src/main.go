@@ -15,6 +15,46 @@ import (
 	"time"
 )
 
+var privateRanges []*net.IPNet
+
+func init() {
+	for _, cidr := range []string{
+		"10.0.0.0/8",
+		"172.16.0.0/12",
+		"192.168.0.0/16",
+		"100.64.0.0/10",
+		"127.0.0.0/8",
+		"169.254.0.0/16",
+		"::1/128",
+		"fc00::/7",
+		"fe80::/10",
+	} {
+		_, ipNet, _ := net.ParseCIDR(cidr)
+		privateRanges = append(privateRanges, ipNet)
+	}
+}
+
+func isPublicIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	for _, r := range privateRanges {
+		if r.Contains(ip) {
+			return false
+		}
+	}
+	return true
+}
+
+func allPublic(addrs []string) bool {
+	for _, a := range addrs {
+		if !isPublicIP(net.ParseIP(a)) {
+			return false
+		}
+	}
+	return true
+}
+
 type result struct {
 	IP        string
 	CN        string
@@ -24,7 +64,9 @@ type result struct {
 
 func main() {
 	dnsServer := flag.String("d", "", "Custom DNS server (e.g. 8.8.8.8)")
+	lax := flag.Bool("l", false, "Lax mode: treat IP mismatch as OK if both IPs are public")
 	port := flag.String("p", "443", "TLS port")
+	quiet := flag.Bool("q", false, "Quiet: suppress results for IPs that failed to connect")
 	timeout := flag.Duration("t", 5*time.Second, "Connection timeout")
 	workers := flag.Int("w", 32, "Number of concurrent workers")
 
@@ -82,7 +124,7 @@ func main() {
 		go func(ip net.IP) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			r := processIP(ip, *port, *timeout, resolver)
+			r := processIP(ip, *port, *timeout, resolver, *lax)
 			mu.Lock()
 			results = append(results, r)
 			mu.Unlock()
@@ -101,12 +143,18 @@ func main() {
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(w, "IP\tCN\tDNS Result\tStatus")
 	for _, r := range results {
+		if *quiet && strings.HasPrefix(r.Status, "ERROR") {
+			continue
+		}
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", r.IP, r.CN, r.DNSResult, r.Status)
 	}
 	w.Flush()
 
 	// Exit code
 	for _, r := range results {
+		if *quiet && strings.HasPrefix(r.Status, "ERROR") {
+			continue
+		}
 		if strings.HasPrefix(r.Status, "FLAGGED") || strings.HasPrefix(r.Status, "ERROR") {
 			os.Exit(1)
 		}
@@ -176,7 +224,7 @@ func incIP(ip net.IP) {
 	}
 }
 
-func processIP(ip net.IP, port string, timeout time.Duration, resolver *net.Resolver) result {
+func processIP(ip net.IP, port string, timeout time.Duration, resolver *net.Resolver, lax bool) result {
 	addr := net.JoinHostPort(ip.String(), port)
 
 	dialer := &net.Dialer{Timeout: timeout}
@@ -248,6 +296,15 @@ func processIP(ip net.IP, port string, timeout time.Duration, resolver *net.Reso
 				DNSResult: dnsResult,
 				Status:    "OK",
 			}
+		}
+	}
+
+	if lax && isPublicIP(net.ParseIP(ipStr)) && allPublic(addrs) {
+		return result{
+			IP:        ipStr,
+			CN:        cn,
+			DNSResult: dnsResult,
+			Status:    "OK (lax)",
 		}
 	}
 

@@ -35,7 +35,9 @@ disconcert [flags] <ip-or-cidr> [...]
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-d` | system resolver | Custom DNS server (e.g. `8.8.8.8`) |
+| `-l` | off | Lax mode: treat IP mismatch as OK if both IPs are public |
 | `-p` | `443` | TLS port to connect to |
+| `-q` | off | Quiet: suppress results for IPs that failed to connect |
 | `-t` | `5s` | Connection and DNS timeout |
 | `-w` | `32` | Number of concurrent workers |
 
@@ -59,6 +61,24 @@ Scan multiple targets on a non-standard port:
 disconcert -p 8443 10.0.0.1 10.0.0.2 192.168.1.0/24
 ```
 
+Lax mode (don't flag public-to-public IP mismatches):
+
+```
+disconcert -l 1.1.1.1
+```
+
+Quiet scan of a range (suppress connection errors):
+
+```
+disconcert -q 8.8.8.0/29
+```
+
+Combined lax and quiet:
+
+```
+disconcert -l -q 8.8.8.0/29
+```
+
 ## Output format
 
 ```
@@ -72,9 +92,10 @@ IP              CN                      DNS Result          Status
 ### Statuses
 
 - **OK** - DNS for the certificate CN resolves back to the scanned IP
+- **OK (lax)** - IP mismatch but both IPs are public (with `-l`)
 - **FLAGGED: NXDOMAIN** - the CN does not exist in DNS
 - **FLAGGED: IP mismatch** - DNS resolves but not to the scanned IP
-- **ERROR** - TLS connection failed or no usable certificate
+- **ERROR** - TLS connection failed or no usable certificate (hidden with `-q`)
 
 ## Exit codes
 

@@ -35,6 +35,7 @@ disconcert [flags] <ip-or-cidr> [...]
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-d` | system resolver | Custom DNS server (e.g. `8.8.8.8`) |
+| `-j` | off | Output results as JSON |
 | `-l` | off | Lax mode: treat IP mismatch as OK if both IPs are public |
 | `-p` | `443` | TLS port to connect to |
 | `-q` | off | Quiet: suppress results for IPs that failed to connect |
@@ -78,6 +79,13 @@ Combined lax and quiet:
 
 ```
 disconcert -l -q 8.8.8.0/29
+```
+
+JSON output:
+
+```
+disconcert -j 8.8.8.0/29
+disconcert -j -q 8.8.8.0/29 | jq '.[] | select(.status == "OK")'
 ```
 
 Verbose mode (debug logging on stderr):

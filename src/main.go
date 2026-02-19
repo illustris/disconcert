@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -58,14 +59,15 @@ func allPublic(addrs []string) bool {
 }
 
 type result struct {
-	IP        string
-	CN        string
-	DNSResult string
-	Status    string
+	IP        string `json:"ip"`
+	CN        string `json:"cn"`
+	DNSResult string `json:"dns_result"`
+	Status    string `json:"status"`
 }
 
 func main() {
 	dnsServer := flag.String("d", "", "Custom DNS server (e.g. 8.8.8.8)")
+	jsonOutput := flag.Bool("j", false, "Output results as JSON")
 	lax := flag.Bool("l", false, "Lax mode: treat IP mismatch as OK if both IPs are public")
 	port := flag.String("p", "443", "TLS port")
 	quiet := flag.Bool("q", false, "Quiet: suppress results for IPs that failed to connect")
@@ -159,22 +161,29 @@ func main() {
 		return bytes4(a).Less(bytes4(b))
 	})
 
-	// Print results
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "IP\tCN\tDNS Result\tStatus")
+	// Filter results
+	var filtered []result
 	for _, r := range results {
 		if *quiet && strings.HasPrefix(r.Status, "ERROR") {
 			continue
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", r.IP, r.CN, r.DNSResult, r.Status)
+		filtered = append(filtered, r)
 	}
-	w.Flush()
+
+	// Print results
+	if *jsonOutput {
+		json.NewEncoder(os.Stdout).Encode(filtered)
+	} else {
+		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(w, "IP\tCN\tDNS Result\tStatus")
+		for _, r := range filtered {
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", r.IP, r.CN, r.DNSResult, r.Status)
+		}
+		w.Flush()
+	}
 
 	// Exit code
-	for _, r := range results {
-		if *quiet && strings.HasPrefix(r.Status, "ERROR") {
-			continue
-		}
+	for _, r := range filtered {
 		if strings.HasPrefix(r.Status, "FLAGGED") || strings.HasPrefix(r.Status, "ERROR") {
 			os.Exit(1)
 		}

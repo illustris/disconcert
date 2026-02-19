@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"sort"
 	"strings"
@@ -76,7 +77,7 @@ func main() {
 	workers := flag.Int("w", 32, "Number of concurrent workers")
 
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: disconcert [flags] <ip-or-cidr> [...]\n\nFlags:\n")
+		fmt.Fprintf(os.Stderr, "Usage: disconcert [flags] <ip|cidr|asn> [...]\n\nFlags:\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -96,6 +97,26 @@ func main() {
 	// Collect all IPs from arguments
 	var ips []net.IP
 	for _, arg := range flag.Args() {
+		if asn, ok := isASN(arg); ok {
+			prefixes, err := resolveASN(asn, *timeout, debug)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error resolving %s: %v\n", asn, err)
+				os.Exit(2)
+			}
+			for _, prefix := range prefixes {
+				if strings.Contains(prefix, ":") {
+					debug.Printf("%s: skipping IPv6 prefix %s", asn, prefix)
+					continue
+				}
+				parsed, err := parseTarget(prefix)
+				if err != nil {
+					debug.Printf("%s: skipping prefix %s: %v", asn, prefix, err)
+					continue
+				}
+				ips = append(ips, parsed...)
+			}
+			continue
+		}
 		parsed, err := parseTarget(arg)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error parsing %q: %v\n", arg, err)
@@ -200,7 +221,7 @@ func parseTarget(s string) ([]net.IP, error) {
 	// Try single IP
 	ip := net.ParseIP(s)
 	if ip == nil {
-		return nil, fmt.Errorf("invalid IP or CIDR: %s", s)
+		return nil, fmt.Errorf("invalid target: %s", s)
 	}
 	return []net.IP{ip}, nil
 }
@@ -236,6 +257,82 @@ func expandCIDR(ipNet *net.IPNet) []net.IP {
 		ips = append(ips, cloneIP(ip))
 	}
 	return ips
+}
+
+func isASN(s string) (string, bool) {
+	if len(s) < 3 {
+		return "", false
+	}
+	prefix := strings.ToUpper(s[:2])
+	if prefix != "AS" {
+		return "", false
+	}
+	digits := s[2:]
+	if len(digits) == 0 {
+		return "", false
+	}
+	for _, r := range digits {
+		if r < '0' || r > '9' {
+			return "", false
+		}
+	}
+	return "AS" + digits, true
+}
+
+type ripePrefix struct {
+	Prefix string `json:"prefix"`
+}
+
+type ripeData struct {
+	Prefixes []ripePrefix `json:"prefixes"`
+}
+
+type ripeResponse struct {
+	Status string   `json:"status"`
+	Data   ripeData `json:"data"`
+}
+
+func resolveASN(asn string, timeout time.Duration, debug *log.Logger) ([]string, error) {
+	url := "https://stat.ripe.net/data/announced-prefixes/data.json?resource=" + asn
+	debug.Printf("%s: fetching announced prefixes from RIPE", asn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("creating request: %w", err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetching RIPE data: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("RIPE API returned HTTP %d", resp.StatusCode)
+	}
+
+	var ripe ripeResponse
+	if err := json.NewDecoder(resp.Body).Decode(&ripe); err != nil {
+		return nil, fmt.Errorf("decoding RIPE response: %w", err)
+	}
+
+	if ripe.Status != "ok" {
+		return nil, fmt.Errorf("RIPE API status: %s", ripe.Status)
+	}
+
+	if len(ripe.Data.Prefixes) == 0 {
+		return nil, fmt.Errorf("no announced prefixes for %s", asn)
+	}
+
+	prefixes := make([]string, len(ripe.Data.Prefixes))
+	for i, p := range ripe.Data.Prefixes {
+		prefixes[i] = p.Prefix
+	}
+	debug.Printf("%s: found %d announced prefixes", asn, len(prefixes))
+	return prefixes, nil
 }
 
 func cloneIP(ip net.IP) net.IP {

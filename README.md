@@ -1,8 +1,8 @@
 # disconcert
 
-TLS certificate/DNS consistency checker. Scans IPs or CIDR ranges, retrieves
-TLS certificate common names, and verifies that DNS for each CN resolves back
-to the original IP.
+TLS certificate/DNS consistency checker. Scans IPs, CIDR ranges, or entire
+autonomous systems (by ASN), retrieves TLS certificate common names, and
+verifies that DNS for each CN resolves back to the original IP.
 
 ## Installation
 
@@ -27,7 +27,7 @@ cd src && go build -o disconcert .
 ## Usage
 
 ```
-disconcert [flags] <ip-or-cidr> [...]
+disconcert [flags] <ip|cidr|asn> [...]
 ```
 
 ### Flags
@@ -88,6 +88,18 @@ disconcert -j 8.8.8.0/29
 disconcert -j -q 8.8.8.0/29 | jq '.[] | select(.status == "OK")'
 ```
 
+Scan all announced IPv4 prefixes of an ASN:
+
+```
+disconcert AS13335
+```
+
+Mix ASN and IP targets:
+
+```
+disconcert AS13335 1.1.1.1
+```
+
 Verbose mode (debug logging on stderr):
 
 ```
@@ -120,13 +132,18 @@ IP              CN                      DNS Result          Status
 | 1 | One or more results flagged or errored |
 | 2 | Usage error (bad arguments) |
 
+**Note:** IPv6 prefixes from ASN resolution are automatically skipped, since
+expanding large IPv6 ranges is impractical. Pass IPv6 targets directly to scan
+them.
+
 ## How it works
 
-1. Parses each argument as a single IP or CIDR range
-2. Expands CIDR ranges to individual host IPs (excluding network/broadcast)
-3. Connects to each IP over TLS with certificate verification disabled
-4. Extracts the Common Name (CN) from the leaf certificate, falling back to
+1. Parses each argument as a single IP, CIDR range, or ASN
+2. For ASN arguments, resolves announced IPv4 prefixes via RIPE RIPEstat API
+3. Expands CIDR ranges to individual host IPs (excluding network/broadcast)
+4. Connects to each IP over TLS with certificate verification disabled
+5. Extracts the Common Name (CN) from the leaf certificate, falling back to
    the first SAN DNS name if CN is empty
-5. Performs a DNS lookup on the CN
-6. Compares the resolved addresses against the original IP
-7. Reports mismatches as flagged results
+6. Performs a DNS lookup on the CN
+7. Compares the resolved addresses against the original IP
+8. Reports mismatches as flagged results

@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -350,6 +351,21 @@ func incIP(ip net.IP) {
 	}
 }
 
+var hostnameLabelRe = regexp.MustCompile(`^[a-zA-Z0-9-]+$`)
+
+func isValidHostname(s string) bool {
+	if strings.Contains(s, " ") {
+		return false
+	}
+	name := strings.TrimPrefix(s, "*.")
+	for _, label := range strings.Split(name, ".") {
+		if !hostnameLabelRe.MatchString(label) {
+			return false
+		}
+	}
+	return true
+}
+
 func processIP(ip net.IP, port string, timeout time.Duration, resolver *net.Resolver, lax bool, debug *log.Logger) result {
 	addr := net.JoinHostPort(ip.String(), port)
 
@@ -379,12 +395,22 @@ func processIP(ip net.IP, port string, timeout time.Duration, resolver *net.Reso
 		}
 	}
 
-	cn := certs[0].Subject.CommonName
-	if cn == "" && len(certs[0].DNSNames) > 0 {
-		cn = certs[0].DNSNames[0]
+	// Prefer SAN DNS names over Subject CN (RFC 6125)
+	var names []string
+	if len(certs[0].DNSNames) > 0 {
+		for _, name := range certs[0].DNSNames {
+			if isValidHostname(name) {
+				names = append(names, name)
+			}
+		}
 	}
-	debug.Printf("%s: TLS OK, CN=%s", ip, cn)
-	if cn == "" {
+	if len(names) == 0 && certs[0].Subject.CommonName != "" && isValidHostname(certs[0].Subject.CommonName) {
+		names = []string{certs[0].Subject.CommonName}
+	}
+	displayName := strings.Join(names, ",")
+
+	debug.Printf("%s: TLS OK, names=%s", ip, displayName)
+	if len(names) == 0 {
 		return result{
 			IP:        ip.String(),
 			CN:        "-",
@@ -393,56 +419,94 @@ func processIP(ip net.IP, port string, timeout time.Duration, resolver *net.Reso
 		}
 	}
 
-	// DNS lookup
-	debug.Printf("%s: looking up %s", ip, cn)
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	addrs, err := resolver.LookupHost(ctx, cn)
-	if err != nil {
-		debug.Printf("%s: DNS error: %s", ip, err)
-		if dnsErr, ok := err.(*net.DNSError); ok && dnsErr.IsNotFound {
-			return result{
-				IP:        ip.String(),
-				CN:        cn,
-				DNSResult: "-",
-				Status:    "FLAGGED: NXDOMAIN",
-			}
-		}
-		return result{
-			IP:        ip.String(),
-			CN:        cn,
-			DNSResult: "-",
-			Status:    fmt.Sprintf("ERROR: DNS lookup failed: %s", err),
+	// Build deduplicated lookup targets (strip wildcard prefixes)
+	seen := make(map[string]bool)
+	var lookups []string
+	for _, name := range names {
+		lookup := strings.TrimPrefix(name, "*.")
+		if !seen[lookup] {
+			seen[lookup] = true
+			lookups = append(lookups, lookup)
 		}
 	}
-	debug.Printf("%s: %s -> %s", ip, cn, addrs)
 
-	dnsResult := strings.Join(addrs, ",")
+	// DNS lookup for all targets
 	ipStr := ip.String()
-	for _, a := range addrs {
-		if a == ipStr {
-			return result{
-				IP:        ipStr,
-				CN:        cn,
-				DNSResult: dnsResult,
-				Status:    "OK",
+	allOK := true
+	allNXDOMAIN := true
+	var allAddrs []string
+	var lastErr error
+	laxUsed := false
+
+	for _, lookup := range lookups {
+		debug.Printf("%s: looking up %s", ip, lookup)
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		addrs, err := resolver.LookupHost(ctx, lookup)
+		cancel()
+		if err != nil {
+			debug.Printf("%s: DNS error for %s: %s", ip, lookup, err)
+			allOK = false
+			if dnsErr, ok := err.(*net.DNSError); ok && dnsErr.IsNotFound {
+				continue
+			}
+			allNXDOMAIN = false
+			lastErr = err
+			continue
+		}
+		allNXDOMAIN = false
+		debug.Printf("%s: %s -> %s", ip, lookup, addrs)
+		allAddrs = append(allAddrs, addrs...)
+
+		found := false
+		for _, a := range addrs {
+			if a == ipStr {
+				found = true
+				break
+			}
+		}
+		if !found {
+			if lax && isPublicIP(net.ParseIP(ipStr)) && allPublic(addrs) {
+				laxUsed = true
+			} else {
+				allOK = false
 			}
 		}
 	}
 
-	if lax && isPublicIP(net.ParseIP(ipStr)) && allPublic(addrs) {
+	if allNXDOMAIN {
 		return result{
 			IP:        ipStr,
-			CN:        cn,
+			CN:        displayName,
+			DNSResult: "-",
+			Status:    "FLAGGED: NXDOMAIN",
+		}
+	}
+	if lastErr != nil && len(allAddrs) == 0 {
+		return result{
+			IP:        ipStr,
+			CN:        displayName,
+			DNSResult: "-",
+			Status:    fmt.Sprintf("ERROR: DNS lookup failed: %s", lastErr),
+		}
+	}
+
+	dnsResult := strings.Join(allAddrs, ",")
+	if allOK {
+		status := "OK"
+		if laxUsed {
+			status = "OK (lax)"
+		}
+		return result{
+			IP:        ipStr,
+			CN:        displayName,
 			DNSResult: dnsResult,
-			Status:    "OK (lax)",
+			Status:    status,
 		}
 	}
 
 	return result{
 		IP:        ipStr,
-		CN:        cn,
+		CN:        displayName,
 		DNSResult: dnsResult,
 		Status:    "FLAGGED: IP mismatch",
 	}
